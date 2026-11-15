@@ -11,6 +11,14 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-    # 本服务只做静态 SQL 解析，不配置任何业务数据库连接
+    # 溯源分析不连接业务库；成本分摊使用容器内 SQLite 文件（命名卷持久化）。
     environment:
       PYTHONUNBUFFERED: "1"
+      COST_ALLOCATION_DB: /data/cost_allocations.sqlite3
+    volumes:
+      - salary-cost-data:/data
+    # SQLite 单写者语义依赖容器内单进程；uvicorn 保持单 worker。
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  salary-cost-data:

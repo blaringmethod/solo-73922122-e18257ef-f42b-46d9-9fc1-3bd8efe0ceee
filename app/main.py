@@ -1,15 +1,25 @@
-"""薪酬数据字段溯源 API。
+"""薪酬数据平台 API。
 
-启动后访问 http://localhost:8000/docs 即可在 Swagger UI 中提交分析。
-本服务只做静态 SQL 血缘分析，不连接任何业务数据库。
+两套并列能力：
+
+1. **薪酬数据字段溯源**（``/api/v1/lineage``）：静态 SQL 血缘分析，
+   不连接任何业务数据库；
+2. **部门成本分摊**（``/api/v1/cost-allocations``）：把跨部门任职期间的
+   工资单按部门任职天数转成部门成本事实行，版本化落库到本地 SQLite。
+
+启动后访问 http://localhost:8000/docs 即可在 Swagger UI 中提交与查询。
 """
 
 from __future__ import annotations
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
 from .analyzer import LineageAnalyzer
+from .cost import init_storage
+from .cost_api import router as cost_router
 from .models import AnalyzeRequest, AnalyzeResponse
 from .samples import (
     SAMPLE_SQL_INCOMPLETE,
@@ -19,14 +29,28 @@ from .samples import (
     build_sample_request,
 )
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """启动即初始化成本分摊存储（失败仅告警，请求时会重试）。"""
+    init_storage()
+    yield
+
+
 app = FastAPI(
-    title="薪酬数据字段溯源 API",
-    version="1.0.0",
+    lifespan=lifespan,
+    title="薪酬数据 API（字段溯源 + 部门成本分摊）",
+    version="1.1.0",
     description=(
-        "提交 PostgreSQL SELECT、源表列清单及敏感标记，返回每个输出列的"
-        "物理来源、中间列路径与三态敏感标记，以及筛选/联接/分组依赖。\n\n"
-        "**不连接业务库**，纯静态分析。未知来源的 sensitive 为 `null`，"
-        "绝不等同于无敏感来源；存在任何问题时 `incomplete=true`。"
+        "**字段溯源**：提交 PostgreSQL SELECT、源表列清单及敏感标记，返回每个"
+        "输出列的物理来源、中间列路径与三态敏感标记，以及筛选/联接/分组依赖。"
+        "不连接业务库，纯静态分析；未知来源的 sensitive 为 `null`，绝不等同于"
+        "无敏感来源；存在任何问题时 `incomplete=true`。\n\n"
+        "**部门成本分摊**：提交工资单号、递增修订号、左闭右开至多 31 天的计薪"
+        "区间、整数分金额与无序的部门任职区间，按部门覆盖天数分摊为成本事实行。"
+        "任职必须逐日恰好覆盖一次；余分确定性分配、正负对称、行和恒等于原金额。"
+        "任职快照与分摊明细在同一 SQLite 事务中版本化保存：当前修订同内容重试"
+        "返回原结果，较旧修订或同号异内容返回 409。"
     ),
 )
 
@@ -85,3 +109,7 @@ def analyze_sample(kind: str) -> AnalyzeResponse:
         raise HTTPException(status_code=404, detail=f"未知样例 {kind}")
     req = build_sample_request(kind)
     return LineageAnalyzer(req.tables, dialect=req.dialect).analyze(req.sql)
+
+
+# 部门成本分摊路由（/api/v1/cost-allocations 等）与溯源 API 并存。
+app.include_router(cost_router)
